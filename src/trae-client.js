@@ -29,6 +29,9 @@ const MODEL_MAP = {
   'claude-3.5-sonnet': 'glm-5.2',
   'claude-3.7-sonnet': 'glm-5.2',
   'claude-haiku-4-5': 'glm-5.1',
+  // Claude Code internal models
+  'mimo-v2.5-pro': 'glm-5.2',
+  'mimo-v2.5': 'glm-5.2',
   // GPT -> DeepSeek
   'gpt-4o': 'DeepSeek-V4-Pro',
   'gpt-4o-mini': 'DeepSeek-V4-Flash',
@@ -64,6 +67,7 @@ function generateMachineId() {
 
 function buildHeaders(token, userId) {
   const machineId = generateMachineId();
+  const requestId = crypto.randomUUID();
   return {
     'Authorization': `Cloud-IDE-JWT ${token}`,
     'X-Cloudide-Token': token,
@@ -71,6 +75,7 @@ function buildHeaders(token, userId) {
     'x-app-id': '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
     'x-device-id': hashDeviceId(machineId),
     'x-machine-id': machineId,
+    'x-request-id': requestId,
     'x-ide-version': IDE_VERSION_CN,
     'x-ide-version-code': IDE_VERSION_CODE_CN,
     'x-device-type': 'windows',
@@ -88,11 +93,104 @@ function mapModel(requestedModel) {
 }
 
 /**
+ * Estimate token count from text (rough: ~4 chars per token for mixed CJK/English)
+ */
+function estimateTokens(text) {
+  if (!text) return 0;
+  // CJK characters ~1.5 tokens each, ASCII ~0.25 tokens per char
+  let tokens = 0;
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    if (code > 0x2000) {
+      tokens += 1.5; // CJK and other wide chars
+    } else {
+      tokens += 0.25; // ASCII
+    }
+  }
+  return Math.ceil(tokens);
+}
+
+/**
+ * Get content string from a message
+ */
+function getMessageContent(msg) {
+  if (typeof msg.content === 'string') return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content.map(b => b.text || b.content || '').join(' ');
+  }
+  return '';
+}
+
+/**
+ * Smart context truncation: keep system message + recent messages
+ * to fit within the target token budget
+ * Configure via MAX_CONTEXT_TOKENS env var (default: 16000)
+ */
+function truncateMessages(messages, maxTokens) {
+  if (!maxTokens) {
+    maxTokens = parseInt(process.env.MAX_CONTEXT_TOKENS || '200000', 10);
+  }
+  if (messages.length === 0) return messages;
+
+  // Calculate total tokens
+  let totalTokens = 0;
+  for (const m of messages) {
+    totalTokens += estimateTokens(getMessageContent(m));
+  }
+
+  if (totalTokens <= maxTokens) return messages;
+
+  console.log(`[trae-client] Context truncation: ${totalTokens} est. tokens > ${maxTokens} limit`);
+
+  // Keep system message (first message if it's system role)
+  const result = [];
+  let startIdx = 0;
+
+  if (messages[0] && messages[0].role === 'system') {
+    result.push(messages[0]);
+    startIdx = 1;
+    totalTokens = estimateTokens(getMessageContent(messages[0]));
+  }
+
+  // Add messages from the end (most recent first), until we hit the limit
+  const recentMessages = [];
+  for (let i = messages.length - 1; i >= startIdx; i--) {
+    const msgTokens = estimateTokens(getMessageContent(messages[i]));
+    if (totalTokens + msgTokens > maxTokens && recentMessages.length > 0) {
+      console.log(`[trae-client] Truncated: kept ${result.length + recentMessages.length}/${messages.length} messages`);
+      break;
+    }
+    recentMessages.unshift(messages[i]);
+    totalTokens += msgTokens;
+  }
+
+  // Insert a marker if we truncated
+  if (recentMessages.length < messages.length - startIdx) {
+    const dropped = messages.length - startIdx - recentMessages.length;
+    result.push({
+      role: 'system',
+      content: `[Note: ${dropped} earlier messages were truncated to fit context window]`,
+    });
+  }
+
+  result.push(...recentMessages);
+  console.log(`[trae-client] Final messages: ${result.length}, ~${totalTokens} tokens`);
+  return result;
+}
+
+/**
  * Build Trae chat request body
+ * Each request gets a unique session_id to isolate conversations
  */
 function buildChatBody(messages, model, stream) {
+  // Truncate context to avoid hitting API limits
+  const truncated = truncateMessages(messages);
+
+  // Generate unique session/request ID to prevent cross-session contamination
+  const sessionId = crypto.randomUUID();
+
   return {
-    messages: messages.map(m => ({
+    messages: truncated.map(m => ({
       role: m.role,
       content: typeof m.content === 'string'
         ? [{ type: 'text', text: m.content }]
@@ -101,6 +199,8 @@ function buildChatBody(messages, model, stream) {
     model: model,
     function: 'inline_chat',
     stream: stream !== false,
+    request_id: sessionId,
+    session_id: sessionId,
   };
 }
 

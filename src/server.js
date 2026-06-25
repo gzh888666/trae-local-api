@@ -30,13 +30,10 @@ const BASE_URL = EDITION === 'cn'
 // Auth middleware
 function requireAuth(req, res, next) {
   if (!API_KEY) return next();
-
-  // Support both Authorization: Bearer <key> and x-api-key: <key>
   const authHeader = req.headers.authorization || '';
   const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim();
   const xApiKey = req.headers['x-api-key'] || '';
   const token = bearerToken || xApiKey;
-
   if (token !== API_KEY) {
     return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
   }
@@ -74,31 +71,305 @@ app.get('/v1/models', requireAuth, async (req, res) => {
   }
 });
 
+// ============================================================
+// Content extraction helpers
+// ============================================================
+
+function extractTextFromBlocks(blocks) {
+  const parts = [];
+  for (const block of blocks) {
+    if (block.type === 'text' && block.text) parts.push(block.text);
+    else if (block.type === 'image') parts.push('[Image]');
+  }
+  return parts.join('\n');
+}
+
+function extractToolResultText(block) {
+  if (typeof block.content === 'string') return block.content || '(empty)';
+  if (Array.isArray(block.content)) {
+    const parts = [];
+    for (const c of block.content) {
+      if (c.type === 'text' && c.text) parts.push(c.text);
+      else if (c.type === 'image') parts.push('[Image]');
+    }
+    return parts.join('\n') || '(empty)';
+  }
+  return '(empty)';
+}
+
+// ============================================================
+// Content cleaning — strip ALL Claude Code internal markers
+// ============================================================
+
+const CLEAN_PATTERNS = [
+  // XML-style tags (handle both closed and unclosed)
+  /<system-reminder>[\s\S]*?<\/system-reminder>/g,
+  /<system-reminder>[\s\S]*?(?=<\/[a-z]|$)/g,
+  /<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g,
+  /<local-command-caveat>[\s\S]*?(?=<\/[a-z]|$)/g,
+  /<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g,
+  /<command-name>[\s\S]*?<\/command-name>/g,
+  /<command-message>[\s\S]*?<\/command-message>/g,
+  /<command-args>[\s\S]*?<\/command-args>/g,
+  /<\/?session>/g,
+  // Bracket-style markers
+  /\[SUGGESTION MODE:[\s\S]*?\]/g,
+  // Tool definition blocks from system prompts
+  /The following deferred tools are now available[\s\S]*?(?:\n\n\n|\n(?=[A-Z#]))/g,
+  /## Available Tools[\s\S]*?(?=\n## [A-Z]|\n# [A-Z]|\n---|\n\*\*)/g,
+];
+
+function cleanContent(text) {
+  if (!text) return '';
+  for (const pattern of CLEAN_PATTERNS) {
+    text = text.replace(pattern, '');
+  }
+  // Collapse multiple blank lines
+  text = text.replace(/\n{3,}/g, '\n\n').trim();
+  return text;
+}
+
+// ============================================================
+// Tool definition → system prompt text
+// ============================================================
+
+function toolsToSystemPrompt(tools) {
+  if (!tools || !Array.isArray(tools) || tools.length === 0) return '';
+  const lines = ['You have access to the following tools. To use a tool, output EXACTLY this format:', '',
+    '<tool_call>', '{"name": "tool_name", "arguments": {"param": "value"}}', '</tool_call>', '',
+    'Available tools:'];
+
+  for (const tool of tools) {
+    const name = tool.name || tool.function?.name || 'unknown';
+    const desc = tool.description || tool.function?.description || '';
+    lines.push(`\n### ${name}`);
+    if (desc) lines.push(desc);
+    const params = tool.input_schema || tool.parameters || tool.function?.parameters;
+    if (params && params.properties) {
+      lines.push('Parameters:');
+      for (const [key, val] of Object.entries(params.properties)) {
+        const required = params.required?.includes(key) ? ' (required)' : '';
+        lines.push(`- ${key}: ${val.type || 'any'}${required} - ${val.description || ''}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+// ============================================================
+// Anthropic message conversion
+// ============================================================
+
+function convertAnthropicMessages(messages, systemPrompt, tools) {
+  const systemParts = [];
+
+  // System prompt
+  if (systemPrompt) {
+    const sysContent = typeof systemPrompt === 'string' ? systemPrompt :
+      Array.isArray(systemPrompt) ? extractTextFromBlocks(systemPrompt) : '';
+    const cleaned = cleanContent(sysContent);
+    if (cleaned) systemParts.push(cleaned);
+  }
+
+  // Tool definitions → system prompt
+  const toolPrompt = toolsToSystemPrompt(tools);
+  if (toolPrompt) systemParts.push(toolPrompt);
+
+  // Collect system-role messages from the array
+  for (const m of messages) {
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content :
+        Array.isArray(m.content) ? extractTextFromBlocks(m.content) : '';
+      const cleaned = cleanContent(text);
+      if (cleaned) systemParts.push(cleaned);
+    }
+  }
+
+  // Build result: ONE system message + non-system messages
+  const result = [];
+  if (systemParts.length > 0) {
+    result.push({ role: 'system', content: systemParts.join('\n\n') });
+  }
+
+  // Process non-system messages
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i];
+    if (m.role === 'system') { i++; continue; }
+
+    // String content
+    if (typeof m.content === 'string') {
+      const cleaned = cleanContent(m.content);
+      if (cleaned) result.push({ role: m.role, content: cleaned });
+      i++; continue;
+    }
+
+    if (!Array.isArray(m.content)) { i++; continue; }
+
+    // Assistant message
+    if (m.role === 'assistant') {
+      const textPart = extractTextFromBlocks(m.content);
+      const toolUses = m.content.filter(b => b.type === 'tool_use');
+
+      // No tool calls — plain text
+      if (toolUses.length === 0) {
+        if (textPart.trim()) result.push({ role: 'assistant', content: textPart });
+        i++; continue;
+      }
+
+      // Has tool calls — merge with next user's tool_result
+      let combinedText = textPart || '';
+
+      if (i + 1 < messages.length && messages[i + 1].role === 'user') {
+        const nextBlocks = Array.isArray(messages[i + 1].content) ? messages[i + 1].content : [];
+        const toolResults = nextBlocks.filter(b => b.type === 'tool_result');
+        const nextText = extractTextFromBlocks(nextBlocks);
+
+        if (toolResults.length > 0) {
+          const toolLines = toolUses.map(tu => {
+            const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
+            return `[Called tool: ${tu.name}]\n${inputStr}`;
+          });
+          const resultLines = toolResults.map(tr => {
+            const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
+            return `${prefix}\n${extractToolResultText(tr)}`;
+          });
+
+          const parts = [];
+          if (combinedText.trim()) parts.push(combinedText);
+          parts.push(toolLines.join('\n\n'));
+          parts.push(resultLines.join('\n\n'));
+          result.push({ role: 'assistant', content: parts.join('\n\n') });
+
+          // Keep any non-tool text from the user message
+          const cleanedNext = cleanContent(nextText);
+          if (cleanedNext) result.push({ role: 'user', content: cleanedNext });
+
+          i += 2; continue;
+        }
+      }
+
+      // No matching tool_result — just describe the calls
+      const toolLines = toolUses.map(tu => {
+        const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
+        return `[Called tool: ${tu.name}]\n${inputStr}`;
+      });
+      if (combinedText.trim()) combinedText += '\n\n';
+      combinedText += toolLines.join('\n\n');
+      if (combinedText.trim()) result.push({ role: 'assistant', content: combinedText });
+      i++;
+
+    } else if (m.role === 'user') {
+      const textPart = extractTextFromBlocks(m.content);
+      const toolResults = m.content.filter(b => b.type === 'tool_result');
+      const cleanedText = cleanContent(textPart);
+
+      if (cleanedText) {
+        result.push({ role: 'user', content: cleanedText });
+      } else if (toolResults.length > 0) {
+        // Orphaned tool results
+        const resultText = toolResults.map(tr => {
+          const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
+          return `${prefix}\n${extractToolResultText(tr)}`;
+        }).join('\n\n');
+        result.push({ role: 'user', content: resultText });
+      }
+      i++;
+    } else {
+      const textPart = extractTextFromBlocks(m.content);
+      const cleaned = cleanContent(textPart);
+      if (cleaned) result.push({ role: m.role, content: cleaned });
+      i++;
+    }
+  }
+
+  // Final: merge any remaining system messages into the first one
+  let firstSys = -1;
+  for (let j = 0; j < result.length; j++) {
+    if (result[j] && result[j].role === 'system') {
+      if (firstSys === -1) { firstSys = j; }
+      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
+    }
+  }
+
+  return result.filter(Boolean);
+}
+
+// ============================================================
+// OpenAI message conversion
+// ============================================================
+
+function convertOpenAIMessages(messages, tools) {
+  const systemParts = [];
+
+  // Tool definitions → system prompt
+  const toolPrompt = toolsToSystemPrompt(tools);
+  if (toolPrompt) systemParts.push(toolPrompt);
+
+  // Collect system messages
+  for (const m of messages) {
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content :
+        Array.isArray(m.content) ? m.content.map(c => c.text || c.content || '').join('\n') : '';
+      const cleaned = cleanContent(text);
+      if (cleaned) systemParts.push(cleaned);
+    }
+  }
+
+  const result = [];
+  if (systemParts.length > 0) {
+    result.push({ role: 'system', content: systemParts.join('\n\n') });
+  }
+
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    let content = '';
+    if (typeof m.content === 'string') content = m.content;
+    else if (Array.isArray(m.content)) content = m.content.map(c => c.text || c.content || '').join('\n');
+    const cleaned = cleanContent(content);
+    if (cleaned) result.push({ role: m.role, content: cleaned });
+  }
+
+  // Merge consecutive system messages
+  let firstSys = -1;
+  for (let j = 0; j < result.length; j++) {
+    if (result[j] && result[j].role === 'system') {
+      if (firstSys === -1) { firstSys = j; }
+      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
+    }
+  }
+
+  return result.filter(Boolean);
+}
+
+// ============================================================
 // OpenAI chat completions
+// ============================================================
+
 app.post('/v1/chat/completions', requireAuth, async (req, res) => {
-  const { messages, model = 'auto', stream = false } = req.body;
+  const { messages, model = 'auto', stream = false, tools } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request' } });
   }
 
-  console.log(`[server] Chat request: model=${model}, stream=${stream}, messages=${messages.length}`);
-  console.log(`[server] Request body: ${JSON.stringify(req.body).substring(0, 500)}`);
+  console.log(`[server] OpenAI request: model=${model}, stream=${stream}, messages=${messages.length}, body=${JSON.stringify(req.body).length} bytes`);
+
+  const converted = convertOpenAIMessages(messages, tools);
+  console.log(`[server] Converted: ${messages.length} -> ${converted.length} messages`);
 
   try {
     const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-      messages, model, stream, BASE_URL
+      converted, model, stream, BASE_URL
     );
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
       const sseStream = await handleOpenAIResponse(fetchResp, usedModel, true);
-      for await (const chunk of sseStream) {
-        res.write(chunk);
-      }
+      for await (const chunk of sseStream) { res.write(chunk); }
       res.end();
     } else {
       const result = await handleOpenAIResponse(fetchResp, usedModel, false);
@@ -106,78 +377,55 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
     }
   } catch (err) {
     console.error(`[server] Chat error: ${err.message}`);
-    res.status(502).json({
-      error: {
-        message: `Trae API error: ${err.message}`,
-        type: 'upstream_error',
-      },
-    });
+    res.status(502).json({ error: { message: `Trae API error: ${err.message}`, type: 'upstream_error' } });
   }
 });
 
+// ============================================================
 // Anthropic messages
-app.post('/v1/messages', requireAuth, async (req, res) => {
-  console.log(`[server] Anthropic request body: ${JSON.stringify(req.body).substring(0, 800)}`);
+// ============================================================
 
-  const { messages, model = 'auto', stream = false, max_tokens = 4096, system } = req.body;
+app.post('/v1/messages', requireAuth, async (req, res) => {
+  const { messages, model = 'auto', stream = false, max_tokens = 4096, system, tools } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request' } });
   }
 
-  // Convert Anthropic messages to OpenAI format
-  const openaiMessages = [];
+  const bodySize = JSON.stringify(req.body).length;
+  console.log(`[server] Anthropic request: model=${model}, stream=${stream}, msgs=${messages.length}, tools=${tools?.length || 0}, body=${bodySize} bytes`);
 
-  // Add system message if present
-  if (system) {
-    const sysContent = typeof system === 'string' ? system :
-      Array.isArray(system) ? system.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
-    if (sysContent) {
-      openaiMessages.push({ role: 'system', content: sysContent });
-    }
+  // Log input messages
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const types = Array.isArray(m.content) ? m.content.map(b => b.type).join('+') : typeof m.content;
+    console.log(`[server]   in[${i}] role=${m.role}, types=${types}`);
   }
 
-  for (const m of messages) {
-    let content = '';
-    if (typeof m.content === 'string') {
-      content = m.content;
-    } else if (Array.isArray(m.content)) {
-      // Handle content blocks (text, tool_use, tool_result, etc.)
-      const textParts = [];
-      for (const block of m.content) {
-        if (block.type === 'text') {
-          textParts.push(block.text);
-        } else if (block.type === 'tool_use') {
-          textParts.push(`[Tool: ${block.name}] ${JSON.stringify(block.input)}`);
-        } else if (block.type === 'tool_result') {
-          const resultContent = typeof block.content === 'string' ? block.content :
-            Array.isArray(block.content) ? block.content.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
-          textParts.push(resultContent);
-        }
-      }
-      content = textParts.join('\n');
-    }
-    if (content) {
-      openaiMessages.push({ role: m.role, content });
-    }
-  }
+  // Convert to clean text messages
+  const converted = convertAnthropicMessages(messages, system, tools);
 
-  console.log(`[server] Anthropic request: model=${model}, stream=${stream}`);
+  // Log output messages
+  const totalSize = JSON.stringify(converted).length;
+  console.log(`[server] Converted: ${messages.length} -> ${converted.length} messages, ${totalSize} bytes`);
+  for (let i = 0; i < converted.length; i++) {
+    const m = converted[i];
+    const len = typeof m.content === 'string' ? m.content.length : 0;
+    const preview = typeof m.content === 'string' ? m.content.substring(0, 80).replace(/\n/g, '\\n') : '';
+    console.log(`[server]   out[${i}] role=${m.role}, len=${len}, preview=${preview}`);
+  }
 
   try {
     const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-      openaiMessages, model, stream, BASE_URL
+      converted, model, stream, BASE_URL
     );
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
       const sseStream = await handleAnthropicResponse(fetchResp, usedModel, true);
-      for await (const chunk of sseStream) {
-        res.write(chunk);
-      }
+      for await (const chunk of sseStream) { res.write(chunk); }
       res.end();
     } else {
       const result = await handleAnthropicResponse(fetchResp, usedModel, false);
@@ -185,16 +433,11 @@ app.post('/v1/messages', requireAuth, async (req, res) => {
     }
   } catch (err) {
     console.error(`[server] Anthropic error: ${err.message}`);
-    res.status(502).json({
-      error: {
-        message: `Trae API error: ${err.message}`,
-        type: 'upstream_error',
-      },
-    });
+    res.status(502).json({ error: { message: `Trae API error: ${err.message}`, type: 'upstream_error' } });
   }
 });
 
-// Catch-all for unknown routes
+// Catch-all
 app.use((req, res) => {
   console.log(`[server] Unknown route: ${req.method} ${req.path}`);
   res.status(404).json({ error: { message: `Not found: ${req.method} ${req.path}`, type: 'not_found' } });
