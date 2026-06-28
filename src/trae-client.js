@@ -234,29 +234,45 @@ async function sendChatRequest(messages, model, stream, baseUrl) {
 
   let lastError = null;
 
+  // Connection timeout: 30s to establish, 5min total for streaming.
+  // Long tasks may take a while but should not hang indefinitely.
+  const FETCH_TIMEOUT_MS = stream ? 5 * 60 * 1000 : 60 * 1000;
+
   for (const endpoint of endpoints) {
     const url = `${baseUrl}${endpoint}`;
     console.log(`[trae-client] Trying endpoint: ${endpoint} (model: ${traeModel})`);
+
+    // AbortController for timeout — protects against network hangs
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
       const resp = await fetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
       if (resp.ok) {
+        clearTimeout(timeoutHandle);
         console.log(`[trae-client] Success with endpoint: ${endpoint}`);
         return { response: resp, model: traeModel, endpoint };
       }
 
+      clearTimeout(timeoutHandle);
       const text = await resp.text();
       console.warn(`[trae-client] Endpoint ${endpoint} returned ${resp.status}: ${text.substring(0, 500)}`);
       console.warn(`[trae-client] Request body was: ${JSON.stringify(body).substring(0, 500)}`);
       lastError = new Error(`${endpoint}: ${resp.status} ${text.substring(0, 500)}`);
     } catch (err) {
-      console.warn(`[trae-client] Endpoint ${endpoint} error: ${err.message}`);
-      lastError = err;
+      clearTimeout(timeoutHandle);
+      const isAbort = err.name === 'AbortError';
+      const msg = isAbort
+        ? `timeout after ${FETCH_TIMEOUT_MS}ms`
+        : err.message;
+      console.warn(`[trae-client] Endpoint ${endpoint} error: ${msg}`);
+      lastError = new Error(`${endpoint}: ${msg}`);
     }
   }
 
@@ -290,10 +306,97 @@ async function getModels(baseUrl) {
   return allModels;
 }
 
+/**
+ * Generate image via Trae CN text_to_image API
+ * Returns JPEG image buffer
+ *
+ * image_size mapping (OpenAI -> Trae CN):
+ *   1024x1024 / square   -> square
+ *   256x256 / 512x512    -> square_hd
+ *   1792x1024            -> landscape_16_9
+ *   1024x1792            -> portrait_16_9
+ *   1536x1024            -> landscape_4_3
+ *   1024x1536            -> portrait_4_3
+ */
+const IMAGE_SIZE_MAP = {
+  '1024x1024': 'square',
+  '256x256': 'square_hd',
+  '512x512': 'square_hd',
+  '1792x1024': 'landscape_16_9',
+  '1024x1792': 'portrait_16_9',
+  '1536x1024': 'landscape_4_3',
+  '1024x1536': 'portrait_4_3',
+};
+
+function mapImageSize(size) {
+  if (!size) return 'square';
+  // Direct Trae CN size name
+  if (['square_hd', 'square', 'portrait_4_3', 'portrait_16_9', 'landscape_4_3', 'landscape_16_9'].includes(size)) {
+    return size;
+  }
+  // OpenAI size -> Trae CN
+  return IMAGE_SIZE_MAP[size] || 'square';
+}
+
+async function generateImage(prompt, size, baseUrl) {
+  const token = auth.getToken();
+  const userId = auth.getUserId();
+
+  if (!token) {
+    throw new Error('No auth token available');
+  }
+
+  if (auth.needsRefresh()) {
+    await auth.refreshToken();
+  }
+
+  const traeSize = mapImageSize(size);
+  const encodedPrompt = encodeURIComponent(prompt);
+  const url = `${baseUrl}/api/ide/v1/text_to_image?prompt=${encodedPrompt}&image_size=${traeSize}`;
+
+  console.log(`[trae-client] Image generation: prompt="${prompt.substring(0, 60)}", size=${traeSize}`);
+
+  const headers = buildHeaders(token, userId);
+  // Image API doesn't use SSE
+  headers['Accept'] = 'image/*';
+
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), 60 * 1000);
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    throw new Error(`Image API fetch error: ${err.name === 'AbortError' ? 'timeout 60s' : err.message}`);
+  }
+  clearTimeout(timeoutHandle);
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Image API error: ${resp.status} ${text.substring(0, 300)}`);
+  }
+
+  const contentType = resp.headers.get('Content-Type') || '';
+  if (!contentType.startsWith('image/')) {
+    const text = await resp.text();
+    throw new Error(`Image API returned non-image content-type: ${contentType}, body: ${text.substring(0, 300)}`);
+  }
+
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  console.log(`[trae-client] Image generated: ${buffer.length} bytes, type=${contentType}`);
+  return { buffer, contentType };
+}
+
 module.exports = {
   sendChatRequest,
   getModels,
   mapModel,
+  generateImage,
+  mapImageSize,
   MODEL_MAP,
   MODEL_TIERS,
 };

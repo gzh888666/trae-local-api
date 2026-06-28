@@ -69,7 +69,7 @@ const envContent = [
   '',
   '# Server config',
   'API_KEY=trae-local-api',
-  'PORT=19900',
+  'PORT=9220',
   '',
 ].join('\n');
 

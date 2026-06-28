@@ -79,7 +79,7 @@ function _saveEnv(edition) {
       `TRAE_TOKEN_EXPIRES=${authData.expiredAt || ''}`,
       `TRAE_REFRESH_EXPIRES=${authData.refreshExpiredAt || ''}`,
       `API_KEY=trae-local-api`,
-      `PORT=19900`,
+      `PORT=9220`,
     ];
     fs.writeFileSync(ENV_PATH, lines.join('\n') + '\n', 'utf8');
     console.log(`[auth] Saved credentials to ${ENV_PATH}`);

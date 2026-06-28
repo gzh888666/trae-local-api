@@ -3,9 +3,9 @@ chcp 65001 >nul
 title Trae Local API Server
 
 echo.
-echo ╔══════════════════════════════════════════╗
-echo ║    Trae Local API - One Click Start      ║
-echo ╚══════════════════════════════════════════╝
+echo ============================================
+echo    Trae Local API - One Click Start
+echo ============================================
 echo.
 
 cd /d "%~dp0"
