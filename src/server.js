@@ -431,9 +431,15 @@ function convertOpenAIMessages(messages, tools) {
       let tc = typeof m.content === 'string' ? m.content :
         Array.isArray(m.content) ? m.content.map(c => c.text || c.content || '').join('\n') : '';
       // Aggressive truncation: in long agent loops, tool results accumulate and
-      // cause context bloat (91KB+ requests, convertedMsgs=196+). Keep head+tail.
+      // cause context bloat (91KB+ requests, convertedMsgs=209+). Keep head+tail.
       // Scale truncation with conversation length — much more aggressive at high counts.
       const totalMsgs = messages.length;
+      // At extreme counts (>150), replace tool result entirely with a stop directive.
+      // The model has called tools 75+ times without finishing — it needs to stop.
+      if (totalMsgs > 150) {
+        result.push({ role: 'user', content: '[FORCE STOP: 对话已超过 150 轮。任务过长，请立即停止调用工具，给出当前进展和最终答案。不要再执行任何工具。]' });
+        continue;
+      }
       const truncLimit = totalMsgs > 100 ? 400 : (totalMsgs > 50 ? 800 : (totalMsgs > 20 ? 1500 : (totalMsgs > 10 ? 2000 : 3000)));
       if (tc && tc.length > truncLimit) {
         const headLen = Math.floor(truncLimit * 0.6);
@@ -488,19 +494,33 @@ function convertOpenAIMessages(messages, tools) {
   const hasTools = tools && Array.isArray(tools) && tools.length > 0;
   if (hasTools && result.length > 0) {
     // === Loop detection: scan recent assistant tool_calls for repetition ===
-    // Two kinds of loops:
+    // Three kinds of loops:
     //   A) Exact repeat: same name+args 3+ times in last 8 calls
     //   B) Tool over-use: same tool name 10+ times in last 15 calls (different args)
+    //   C) Virtual tool_call loop: our injected echo 'Continue...' appears 3+ times
+    //      → model keeps abandoning, we keep injecting, infinite loop
     const recentToolCallSigs = [];
     const recentToolNames = [];
+    let virtualRetryCount = 0;
     for (let k = messages.length - 1; k >= 0 && (recentToolCallSigs.length < 8 || recentToolNames.length < 15); k--) {
       const msg = messages[k];
+      // Check for virtual tool_call injection loop: scan tool results for our echo output
+      if (msg && (msg.role === 'tool' || msg.role === 'user')) {
+        const content = typeof msg.content === 'string' ? msg.content : '';
+        if (content.includes("echo 'Continue") || content.includes("Continue: use <tool_call>") || content.includes("Continue: you have full filesystem") || content.includes("Continue: response was too long")) {
+          virtualRetryCount++;
+        }
+      }
       if (msg && msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
         for (const tc of msg.tool_calls) {
           const name = tc.function?.name || '';
           const args = (tc.function?.arguments || '').substring(0, 120);
           recentToolCallSigs.push(`${name}:${args}`);
           if (recentToolNames.length < 15) recentToolNames.push(name);
+          // Also check tool_call arguments for our virtual echo
+          if (args.includes("echo 'Continue") || args.includes("echo \\'Continue")) {
+            virtualRetryCount++;
+          }
         }
       }
     }
@@ -510,6 +530,8 @@ function convertOpenAIMessages(messages, tools) {
     for (const name of recentToolNames) { nameCounts[name] = (nameCounts[name] || 0) + 1; }
     const hasLoop = Object.values(sigCounts).some(c => c >= 3);
     const hasToolOveruse = Object.values(nameCounts).some(c => c >= 10);
+    // Virtual tool_call loop: model abandoned 3+ times, injecting more won't help
+    const hasVirtualLoop = virtualRetryCount >= 3;
 
     // === Message-count convergence: force task completion at high counts ===
     // convertedMsgs measures total messages in the conversation. At high counts,
@@ -530,6 +552,16 @@ function convertOpenAIMessages(messages, tools) {
         result[lastUserIdx].content += loopBreaker;
       } else {
         result.push({ role: 'system', content: loopBreaker.trim() });
+      }
+    } else if (hasVirtualLoop) {
+      // Virtual tool_call injection loop: model abandoned 3+ times, injecting
+      // more virtual tool_calls won't help — it will just abandon again.
+      // Force a hard stop with a clear explanation.
+      const virtualLoopBreaker = '\n\n[CRITICAL: 检测到重复放弃模式。你已经多次尝试"提供建议"或"描述动作"而不是执行任务。系统无法继续注入重试指令。请立即给出当前任务进展的总结和最终答案。不要再尝试调用工具。]';
+      if (lastUserIdx !== -1) {
+        result[lastUserIdx].content += virtualLoopBreaker;
+      } else {
+        result.push({ role: 'system', content: virtualLoopBreaker.trim() });
       }
     } else if (hasToolOveruse) {
       const overuseWarning = '\n\n[WARNING: Same tool called 10+ times recently. You may be stuck in a loop. Step back, review what you have done, and either complete the task with a final answer or try a fundamentally different approach. Do NOT continue calling the same tool.]';
@@ -599,9 +631,44 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
   // Check last user message for loop/convergence directives injected by convertOpenAIMessages
   const lastUserMsg = [...converted].reverse().find(m => m.role === 'user');
   const hasLoopDirective = lastUserMsg ? lastUserMsg.content.includes('[LOOP DETECTED]') : false;
+  const hasVirtualLoopDirective = lastUserMsg ? lastUserMsg.content.includes('重复放弃模式') : false;
   const hasConvergeDirective = lastUserMsg ? lastUserMsg.content.includes('[CONVERGENCE CHECK]') : false;
-  const directiveFlag = hasLoopDirective ? ' [LOOP_BREAKER]' : (hasConvergeDirective ? ' [CONVERGE]' : '');
+  const directiveFlag = hasLoopDirective ? ' [LOOP_BREAKER]' : (hasVirtualLoopDirective ? ' [VIRTUAL_LOOP]' : (hasConvergeDirective ? ' [CONVERGE]' : ''));
   debugLog(`REQUEST tools=${toolsCount}, sysHasToolCall=${sysHasToolCall}, sysLen=${sysLen}, convertedMsgs=${converted.length}, stream=${stream}, model=${model}${ctxFlag}${directiveFlag}`);
+
+  // === ULTIMATE SAFETY NET: hard-stop at 200+ messages ===
+  // If the agent loop reaches 200+ messages, it's in an unrecoverable loop.
+  // Don't forward to Trae API — return a direct stop response to break the loop.
+  if (converted.length > 200 && toolsCount > 0) {
+    debugLog(`HARD_STOP: convertedMsgs=${converted.length} > 200, returning direct stop response`);
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const stopId = `chatcmpl-${Date.now()}`;
+      const stopTs = Math.floor(Date.now() / 1000);
+      const stopContent = '任务已超出最大执行长度（200+ 轮对话）。以下是当前进展的总结：\n\n由于对话轮数过多，系统强制停止了工具调用循环。请开启一个新的对话继续任务，或检查任务是否已在之前的步骤中完成。';
+      res.write(`data: ${JSON.stringify({ id: stopId, object: 'chat.completion.chunk', created: stopTs, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: stopId, object: 'chat.completion.chunk', created: stopTs, model, choices: [{ index: 0, delta: { content: stopContent }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: stopId, object: 'chat.completion.chunk', created: stopTs, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.json({
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: '任务已超出最大执行长度（200+ 轮对话）。请开启一个新的对话继续任务。' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
+    }
+    return;
+  }
 
   let streamStarted = false;
   try {
